@@ -13,6 +13,7 @@ import multiprocessing
 from contextlib import contextmanager, ExitStack
 
 import numpy as np
+import glob
 
 import torch
 from torch import nn, einsum
@@ -256,6 +257,10 @@ def calc_pl_lengths(styles, images):
 def noise(n, latent_dim, device):
     return torch.randn(n, latent_dim).cuda(device)
 
+def random_labels(n, cat_len):
+    r = torch.randint(cat_len, size=(n, ))
+    return torch.eye(cat_len)[r]
+
 def noise_list(n, layers, latent_dim, device):
     return [(noise(n, latent_dim, device), layers)]
 
@@ -263,8 +268,8 @@ def mixed_list(n, layers, latent_dim, device):
     tt = int(torch.rand(()).numpy() * layers)
     return noise_list(n, tt, latent_dim, device) + noise_list(n, layers - tt, latent_dim, device)
 
-def latent_to_w(style_vectorizer, latent_descr):
-    return [(style_vectorizer(z), num_layers) for z, num_layers in latent_descr]
+def latent_to_w(style_vectorizer, latent_descr, labels):
+    return [(style_vectorizer(z, labels), num_layers) for z, num_layers in latent_descr]
 
 def image_noise(n, im_size, device):
     return torch.FloatTensor(n, im_size, im_size, 1).uniform_(0., 1.).cuda(device)
@@ -301,6 +306,12 @@ def gen_hinge_loss(fake, real):
 
 def hinge_loss(real, fake):
     return (F.relu(1 + real) + F.relu(1 - fake)).mean()
+
+def softmax_loss(real, fake):
+    return (F.softplus(-real)+F.softplus(fake)).mean()
+
+def gen_softmax_loss(fake, real):
+    return F.softplus(-fake).mean()
 
 def dual_contrastive_loss(real_logits, fake_logits):
     device = real_logits.device
@@ -364,6 +375,18 @@ class Dataset(data.Dataset):
         self.paths = [p for ext in EXTS for p in Path(f'{folder}').glob(f'**/*.{ext}')]
         assert len(self.paths) > 0, f'No images were found in {folder} for training'
 
+        _categories = sorted(glob.glob(os.path.join(folder, '**')))
+        categories = []
+        for c in _categories:
+            categories.append(c.replace(f"{folder}",""))
+        categories = sorted(categories)
+        cat_map = {}
+        for i, c in enumerate(categories):
+            cat_map[c] = i
+        print("Number of categories: ", len(cat_map))
+        self.cat_map = cat_map
+        self.cat_len = len(cat_map)
+
         convert_image_fn = convert_transparent_to_rgb if not transparent else convert_rgb_to_transparent
         num_channels = 3 if not transparent else 4
 
@@ -382,7 +405,10 @@ class Dataset(data.Dataset):
     def __getitem__(self, index):
         path = self.paths[index]
         img = Image.open(path)
-        return self.transform(img)
+        p = str(path).replace(f"{self.folder}", "").split("/")[0]
+        l = np.zeros((self.cat_len, ))
+        l[self.cat_map[p]] = 1
+        return self.transform(img), l
 
 # augmentations
 
@@ -396,41 +422,52 @@ class AugWrapper(nn.Module):
         super().__init__()
         self.D = D
 
-    def forward(self, images, prob = 0., types = [], detach = False):
+    def forward(self, images, labels, prob = 0., types = [], detach = False):
         if random() < prob:
             images = random_hflip(images, prob=0.5)
             images = DiffAugment(images, types=types)
 
         if detach:
             images = images.detach()
+            labels = labels.detach()
 
-        return self.D(images)
+        return self.D(images, labels)
 
 # stylegan2 classes
 
 class EqualLinear(nn.Module):
-    def __init__(self, in_dim, out_dim, lr_mul = 1, bias = True):
+    def __init__(self, in_dim, out_dim, lr_mul = 1., bias = True):
         super().__init__()
         self.weight = nn.Parameter(torch.randn(out_dim, in_dim))
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_dim))
-
+        else:
+            self.bias = None
         self.lr_mul = lr_mul
 
     def forward(self, input):
-        return F.linear(input, self.weight * self.lr_mul, bias=self.bias * self.lr_mul)
+        if self.bias is not None:
+            return F.linear(input, self.weight * self.lr_mul, bias=self.bias * self.lr_mul)
+        else:
+            return F.linear(input, self.weight * self.lr_mul)
 
 class StyleVectorizer(nn.Module):
-    def __init__(self, emb, depth, lr_mul = 0.1):
+    def __init__(self, emb, depth, cat_len, lr_mul = 0.1):
         super().__init__()
 
         layers = []
-        for i in range(depth):
+        depth_m1 = depth
+        if cat_len>0:
+            layers.extend([EqualLinear(2*emb, emb, lr_mul), leaky_relu()])
+            depth_m1 -= 1
+        for i in range(depth_m1):
             layers.extend([EqualLinear(emb, emb, lr_mul), leaky_relu()])
-
+        self.map = EqualLinear(cat_len, emb, lr_mul, bias=False)
         self.net = nn.Sequential(*layers)
 
-    def forward(self, x):
+    def forward(self, x, label):
+        label = self.map(label)
+        x = torch.cat((x, label), dim=1)
         x = F.normalize(x, dim=1)
         return self.net(x)
 
@@ -460,6 +497,7 @@ class RGBBlock(nn.Module):
             x = self.upsample(x)
 
         return x
+
 
 class Conv2DMod(nn.Module):
     def __init__(self, in_chan, out_chan, kernel, demod=True, stride=1, dilation=1, eps = 1e-8, **kwargs):
@@ -625,7 +663,7 @@ class Generator(nn.Module):
         return rgb
 
 class Discriminator(nn.Module):
-    def __init__(self, image_size, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512):
+    def __init__(self, image_size, cat_len, network_capacity = 16, fq_layers = [], fq_dict_size = 256, attn_layers = [], transparent = False, fmap_max = 512):
         super().__init__()
         num_layers = int(log2(image_size) - 1)
         num_init_filters = 3 if not transparent else 4
@@ -664,9 +702,10 @@ class Discriminator(nn.Module):
 
         self.final_conv = nn.Conv2d(chan_last, chan_last, 3, padding=1)
         self.flatten = Flatten()
-        self.to_logit = nn.Linear(latent_dim, 1)
+        
+        self.to_logit = nn.Linear(latent_dim, cat_len)
 
-    def forward(self, x):
+    def forward(self, x, y):
         b, *_ = x.shape
 
         quantize_loss = torch.zeros(1).to(x)
@@ -684,20 +723,22 @@ class Discriminator(nn.Module):
         x = self.final_conv(x)
         x = self.flatten(x)
         x = self.to_logit(x)
+        x = torch.mul(x, y)
+        x = torch.sum(x, dim=1)
         return x.squeeze(), quantize_loss
 
 class StyleGAN2(nn.Module):
-    def __init__(self, image_size, latent_dim = 512, fmap_max = 512, style_depth = 8, network_capacity = 16, transparent = False, fp16 = False, cl_reg = False, steps = 1, lr = 1e-4, ttur_mult = 2, fq_layers = [], fq_dict_size = 256, attn_layers = [], no_const = False, lr_mlp = 0.1, rank = 0):
+    def __init__(self, image_size, cat_len, latent_dim = 512, fmap_max = 512, style_depth = 8, network_capacity = 16, transparent = False, fp16 = False, cl_reg = False, steps = 1, lr = 1e-4, ttur_mult = 2, fq_layers = [], fq_dict_size = 256, attn_layers = [], no_const = False, lr_mlp = 0.1, rank = 0):
         super().__init__()
         self.lr = lr
         self.steps = steps
         self.ema_updater = EMA(0.995)
 
-        self.S = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
+        self.S = StyleVectorizer(latent_dim, style_depth, cat_len, lr_mul = lr_mlp)
         self.G = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const, fmap_max = fmap_max)
-        self.D = Discriminator(image_size, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max)
+        self.D = Discriminator(image_size, cat_len, network_capacity, fq_layers = fq_layers, fq_dict_size = fq_dict_size, attn_layers = attn_layers, transparent = transparent, fmap_max = fmap_max)
 
-        self.SE = StyleVectorizer(latent_dim, style_depth, lr_mul = lr_mlp)
+        self.SE = StyleVectorizer(latent_dim, style_depth, cat_len, lr_mul = lr_mlp)
         self.GE = Generator(image_size, latent_dim, network_capacity, transparent = transparent, attn_layers = attn_layers, no_const = no_const)
 
         self.D_cl = None
@@ -802,6 +843,8 @@ class Trainer():
         rank = 0,
         world_size = 1,
         log = False,
+        cat_len=1,
+        softmax_loss=False,
         *args,
         **kwargs
     ):
@@ -833,6 +876,8 @@ class Trainer():
         self.aug_prob = aug_prob
         self.aug_types = aug_types
 
+        self.cat_len = cat_len
+        self.softmax_loss = softmax_loss
         self.lr = lr
         self.lr_mlp = lr_mlp
         self.ttur_mult = ttur_mult
@@ -904,7 +949,7 @@ class Trainer():
         
     def init_GAN(self):
         args, kwargs = self.GAN_params
-        self.GAN = StyleGAN2(lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, image_size = self.image_size, network_capacity = self.network_capacity, fmap_max = self.fmap_max, transparent = self.transparent, fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, *args, **kwargs)
+        self.GAN = StyleGAN2(cat_len=self.cat_len, lr = self.lr, lr_mlp = self.lr_mlp, ttur_mult = self.ttur_mult, image_size = self.image_size, network_capacity = self.network_capacity, fmap_max = self.fmap_max, transparent = self.transparent, fq_layers = self.fq_layers, fq_dict_size = self.fq_dict_size, attn_layers = self.attn_layers, fp16 = self.fp16, cl_reg = self.cl_reg, no_const = self.no_const, rank = self.rank, *args, **kwargs)
 
         if self.is_ddp:
             ddp_kwargs = {'device_ids': [self.rank]}
@@ -930,11 +975,13 @@ class Trainer():
         self.attn_layers = config.pop('attn_layers', [])
         self.no_const = config.pop('no_const', False)
         self.lr_mlp = config.pop('lr_mlp', 0.1)
+        self.cat_len = config.pop('cat_len', 1)
+        self.softmax_loss = config.pop('softmax_loss', False)
         del self.GAN
         self.init_GAN()
 
     def config(self):
-        return {'image_size': self.image_size, 'network_capacity': self.network_capacity, 'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const}
+        return {'image_size': self.image_size, 'cat_len': self.cat_len, 'network_capacity': self.network_capacity, 'lr_mlp': self.lr_mlp, 'transparent': self.transparent, 'fq_layers': self.fq_layers, 'fq_dict_size': self.fq_dict_size, 'attn_layers': self.attn_layers, 'no_const': self.no_const}
 
     def set_data_src(self, folder):
         self.dataset = Dataset(folder, self.image_size, transparent = self.transparent, aug_prob = self.dataset_aug_prob)
@@ -951,9 +998,9 @@ class Trainer():
 
     def train(self):
         assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
-
         if not exists(self.GAN):
             self.init_GAN()
+        assert self.dataset.cat_len == self.cat_len
 
         self.GAN.train()
         total_disc_loss = torch.tensor(0.).cuda(self.rank)
@@ -968,7 +1015,6 @@ class Trainer():
         aug_prob   = self.aug_prob
         aug_types  = self.aug_types
         aug_kwargs = {'prob': aug_prob, 'types': aug_types}
-
         apply_gradient_penalty = self.steps % 4 == 0
         apply_path_penalty = not self.no_pl_reg and self.steps > 5000 and self.steps % 32 == 0
         apply_cl_reg_to_generated = self.steps > 20000
@@ -983,21 +1029,25 @@ class Trainer():
         if exists(self.GAN.D_cl):
             self.GAN.D_opt.zero_grad()
 
+            labels = []
+            for i in range(self.gradient_accumulate_every):
+                image_batch, label_batch = next(self.loader)
+                image_batch = image_batch.cuda(self.rank)
+                label_batch = label_batch.float().cuda(self.rank)
+                labels.append(label_batch)
+                self.GAN.D_cl(image_batch, label_batch, accumulate=True)
+            
             if apply_cl_reg_to_generated:
                 for i in range(self.gradient_accumulate_every):
                     get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
                     style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
                     noise = image_noise(batch_size, image_size, device=self.rank)
 
-                    w_space = latent_to_w(self.GAN.S, style)
+                    w_space = latent_to_w(self.GAN.S, style, labels[i])
                     w_styles = styles_def_to_tensor(w_space)
 
                     generated_images = self.GAN.G(w_styles, noise)
-                    self.GAN.D_cl(generated_images.clone().detach(), accumulate=True)
-
-            for i in range(self.gradient_accumulate_every):
-                image_batch = next(self.loader).cuda(self.rank)
-                self.GAN.D_cl(image_batch, accumulate=True)
+                    self.GAN.D_cl(generated_images.clone().detach(), labels[i], accumulate=True)
 
             loss = self.GAN.D_cl.calculate_loss()
             self.last_cr_loss = loss.clone().detach().item()
@@ -1015,6 +1065,11 @@ class Trainer():
             D_loss_fn = dual_contrastive_loss
             G_loss_fn = dual_contrastive_loss
             G_requires_reals = True
+        
+        if self.softmax_loss:
+            D_loss_fn = softmax_loss
+            G_loss_fn = gen_softmax_loss
+            G_requires_reals = False
 
         # train discriminator
 
@@ -1023,18 +1078,21 @@ class Trainer():
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[D_aug, S, G]):
             get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
+            image_batch, label_batch = next(self.loader)
+            image_batch = image_batch.cuda(self.rank)
+            label_batch = label_batch.float().cuda(self.rank)
+
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
 
-            w_space = latent_to_w(S, style)
+            w_space = latent_to_w(S, style, label_batch)
             w_styles = styles_def_to_tensor(w_space)
 
             generated_images = G(w_styles, noise)
-            fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), detach = True, **aug_kwargs)
+            fake_output, fake_q_loss = D_aug(generated_images.clone().detach(), label_batch, detach = True, **aug_kwargs)
 
-            image_batch = next(self.loader).cuda(self.rank)
             image_batch.requires_grad_()
-            real_output, real_q_loss = D_aug(image_batch, **aug_kwargs)
+            real_output, real_q_loss = D_aug(image_batch, label_batch, **aug_kwargs)
 
             real_output_loss = real_output
             fake_output_loss = fake_output
@@ -1072,22 +1130,24 @@ class Trainer():
         # train generator
 
         self.GAN.G_opt.zero_grad()
+        get_latents_fn = mixed_list if random() < self.mixed_prob else noise_list
 
         for i in gradient_accumulate_contexts(self.gradient_accumulate_every, self.is_ddp, ddps=[S, G, D_aug]):
+            labels = random_labels(batch_size, self.cat_len).float().cuda(self.rank)
             style = get_latents_fn(batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(batch_size, image_size, device=self.rank)
-
-            w_space = latent_to_w(S, style)
+            w_space = latent_to_w(S, style, labels)
             w_styles = styles_def_to_tensor(w_space)
-
             generated_images = G(w_styles, noise)
-            fake_output, _ = D_aug(generated_images, **aug_kwargs)
+            fake_output, _ = D_aug(generated_images, labels, **aug_kwargs)
             fake_output_loss = fake_output
 
             real_output = None
             if G_requires_reals:
-                image_batch = next(self.loader).cuda(self.rank)
-                real_output, _ = D_aug(image_batch, detach = True, **aug_kwargs)
+                image_batch, label_batch = next(self.loader)
+                image_batch = image_batch.cuda(self.rank)
+                label_batch = label_batch.cuda(self.rank)
+                real_output, _ = D_aug(image_batch, label_batch, detach = True, **aug_kwargs)
                 real_output = real_output.detach()
 
             if self.top_k_training:
@@ -1115,14 +1175,11 @@ class Trainer():
             backwards(gen_loss, self.GAN.G_opt, loss_id = 2)
 
             total_gen_loss += loss.detach().item() / self.gradient_accumulate_every
-
         self.g_loss = float(total_gen_loss)
         self.track(self.g_loss, 'G')
 
         self.GAN.G_opt.step()
-
         # calculate moving averages
-
         if apply_path_penalty and not np.isnan(avg_pl_length):
             self.pl_mean = self.pl_length_ma.update_average(self.pl_mean, avg_pl_length)
             self.track(self.pl_mean, 'PL')
@@ -1174,17 +1231,15 @@ class Trainer():
 
         latents = noise_list(num_rows ** 2, num_layers, latent_dim, device=self.rank)
         n = image_noise(num_rows ** 2, image_size, device=self.rank)
-
+        labels = random_labels(num_rows**2, self.cat_len).float().cuda(self.rank)
         # regular
 
-        generated_images = self.generate_truncated(self.GAN.S, self.GAN.G, latents, n, trunc_psi = self.trunc_psi)
+        generated_images = self.generate_truncated(self.GAN.S, self.GAN.G, latents, labels, n, trunc_psi = self.trunc_psi)
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
-        
         # moving averages
 
-        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
+        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, labels, n, trunc_psi = self.trunc_psi)
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
-
         # mixing regularities
 
         def tile(a, dim, n_tile):
@@ -1196,13 +1251,13 @@ class Trainer():
             return torch.index_select(a, dim, order_index)
 
         nn = noise(num_rows, latent_dim, device=self.rank)
+        labels = random_labels(num_rows**2, self.cat_len).float().cuda(self.rank)
         tmp1 = tile(nn, 0, num_rows)
         tmp2 = nn.repeat(num_rows, 1)
 
         tt = int(num_layers / 2)
         mixed_latents = [(tmp1, tt), (tmp2, num_layers - tt)]
-
-        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, mixed_latents, n, trunc_psi = self.trunc_psi)
+        generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, mixed_latents, labels, n, trunc_psi = self.trunc_psi)
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-mr.{ext}'), nrow=num_rows)
 
     @torch.no_grad()
@@ -1220,7 +1275,7 @@ class Trainer():
             os.makedirs(real_path)
 
             for batch_num in tqdm(range(num_batches), desc='calculating FID - saving reals'):
-                real_batch = next(self.loader)
+                real_batch, real_label = next(self.loader)
                 for k, image in enumerate(real_batch.unbind(0)):
                     filename = str(k + batch_num * self.batch_size)
                     torchvision.utils.save_image(image, str(real_path / f'{filename}.png'))
@@ -1241,9 +1296,9 @@ class Trainer():
             # latents and noise
             latents = noise_list(self.batch_size, num_layers, latent_dim, device=self.rank)
             noise = image_noise(self.batch_size, image_size, device=self.rank)
-
+            labels = random_labels(self.batch_size, self.cat_len).float().cuda(self.rank)
             # moving averages
-            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, noise, trunc_psi = self.trunc_psi)
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, labels, noise, trunc_psi = self.trunc_psi)
 
             for j, image in enumerate(generated_images.unbind(0)):
                 torchvision.utils.save_image(image, str(fake_path / f'{str(j + batch_num * self.batch_size)}-ema.{ext}'))
@@ -1251,14 +1306,14 @@ class Trainer():
         return fid_score.calculate_fid_given_paths([str(real_path), str(fake_path)], 256, noise.device, 2048)
 
     @torch.no_grad()
-    def truncate_style(self, tensor, trunc_psi = 0.75):
+    def truncate_style(self, tensor, labels, trunc_psi = 0.75):
         S = self.GAN.S
         batch_size = self.batch_size
         latent_dim = self.GAN.G.latent_dim
 
         if not exists(self.av):
             z = noise(2000, latent_dim, device=self.rank)
-            samples = evaluate_in_chunks(batch_size, S, z).cpu().numpy()
+            samples = evaluate_in_chunks(batch_size, S, z, labels).cpu().numpy()
             self.av = np.mean(samples, axis = 0)
             self.av = np.expand_dims(self.av, axis = 0)
 
@@ -1267,17 +1322,17 @@ class Trainer():
         return tensor
 
     @torch.no_grad()
-    def truncate_style_defs(self, w, trunc_psi = 0.75):
+    def truncate_style_defs(self, w, labels, trunc_psi = 0.75):
         w_space = []
         for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, trunc_psi = trunc_psi)            
+            tensor = self.truncate_style(tensor, labels, trunc_psi = trunc_psi)            
             w_space.append((tensor, num_layers))
         return w_space
 
     @torch.no_grad()
-    def generate_truncated(self, S, G, style, noi, trunc_psi = 0.75, num_image_tiles = 8):
-        w = map(lambda t: (S(t[0]), t[1]), style)
-        w_truncated = self.truncate_style_defs(w, trunc_psi = trunc_psi)
+    def generate_truncated(self, S, G, style, labels, noi, trunc_psi = 0.75, num_image_tiles = 8):
+        w = map(lambda x: (S(x[0][0], x[1]), x[0][1]), zip(style, [labels]*len(style)))
+        w_truncated = self.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
         w_styles = styles_def_to_tensor(w_truncated)
         generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
         return generated_images.clamp_(0., 1.)
@@ -1297,14 +1352,14 @@ class Trainer():
         latents_low = noise(num_rows ** 2, latent_dim, device=self.rank)
         latents_high = noise(num_rows ** 2, latent_dim, device=self.rank)
         n = image_noise(num_rows ** 2, image_size, device=self.rank)
-
+        labels = random_labels(num_rows**2, self.cat_len).float().cuda(self.rank)
         ratios = torch.linspace(0., 8., num_steps)
 
         frames = []
         for ratio in tqdm(ratios):
             interp_latents = slerp(ratio, latents_low, latents_high)
             latents = [(interp_latents, num_layers)]
-            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, n, trunc_psi = self.trunc_psi)
+            generated_images = self.generate_truncated(self.GAN.SE, self.GAN.GE, latents, labels, n, trunc_psi = self.trunc_psi)
             images_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
             pil_image = transforms.ToPILImage()(images_grid.cpu())
             
@@ -1396,15 +1451,15 @@ class Trainer():
             amp.load_state_dict(load_data['amp'])
 
 class ModelLoader:
-    def __init__(self, *, base_dir, name = 'default', load_from = -1):
-        self.model = Trainer(name = name, base_dir = base_dir)
+    def __init__(self, *, base_dir, name = 'default', load_from = -1, cat_len=1):
+        self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len)
         self.model.load(load_from)
 
-    def noise_to_styles(self, noise, trunc_psi = None):
+    def noise_to_styles(self, noise,labels, trunc_psi = None):
         noise = noise.cuda()
-        w = self.model.GAN.SE(noise)
+        w = self.model.GAN.SE(noise, labels)
         if exists(trunc_psi):
-            w = self.model.truncate_style(w)
+            w = self.model.truncate_style(w, labels)
         return w
 
     def styles_to_images(self, w):

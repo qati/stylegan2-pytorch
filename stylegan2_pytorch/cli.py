@@ -113,7 +113,9 @@ def train_from_folder(
     calculate_fid_num_images = 12800,
     clear_fid_cache = False,
     seed = 42,
-    log = False
+    log = False,
+    cat_len=27,
+    softmax_loss=False
 ):
     model_args = dict(
         name = name,
@@ -152,7 +154,9 @@ def train_from_folder(
         calculate_fid_num_images = calculate_fid_num_images,
         clear_fid_cache = clear_fid_cache,
         mixed_prob = mixed_prob,
-        log = log
+        log = log,
+        cat_len=cat_len,
+        softmax_loss=softmax_loss
     )
 
     if generate:
@@ -173,6 +177,7 @@ def train_from_folder(
         return
 
     world_size = torch.cuda.device_count()
+    print("Number of available CUDA devices: ", world_size)
 
     if world_size == 1 or not multi_gpus:
         run_training(0, 1, model_args, data, load_from, new, num_train_steps, name, seed)
