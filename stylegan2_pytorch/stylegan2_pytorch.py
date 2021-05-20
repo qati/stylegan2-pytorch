@@ -404,10 +404,14 @@ class Dataset(data.Dataset):
 
     def __getitem__(self, index):
         path = self.paths[index]
-        img = Image.open(path)
-        p = str(path).replace(f"{self.folder}", "").split("/")[0]
-        l = np.zeros((self.cat_len, ))
-        l[self.cat_map[p]] = 1
+        try:
+            img = Image.open(path)
+            p = str(path).replace(f"{self.folder}", "").split("/")[0]
+            l = np.zeros((self.cat_len, ))
+            l[self.cat_map[p]] = 1
+        except KeyError as ex:
+            print(f"Failed to handle category: path={path}, p={p}, folder={self.folder}")
+            raise ex
         return self.transform(img), l
 
 # augmentations
