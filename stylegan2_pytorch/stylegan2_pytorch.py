@@ -1467,9 +1467,11 @@ class ModelLoader:
         return w
 
     @torch.no_grad()
-    def gen_style(self, style, labels, noi, trunc_psi = 0.75):
+    def gen_style(self, style, labels, trunc_psi = 0.75):
+        num_layers = self.GAN.G.num_layers
+        style = [(style, num_layers)]
         w = map(lambda x: (self.model.GAN.S(x[0][0], x[1]), x[0][1]), zip(style, [labels]*len(style)))
-        w_truncated = self.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
+        w_truncated = self.model.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
         w_styles = styles_def_to_tensor(w_truncated)
         return w_styles
 
