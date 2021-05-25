@@ -1482,6 +1482,9 @@ class ModelLoader:
         noise = image_noise(1, image_size, device = 0)
         print(latents)
         print(labels)
+        num_layers = self.model.GAN.G.num_layers
+        labels = [labels]
+        latents = [(latents, num_layers)]
         generated_images = self.model.generate_truncated(self.model.GAN.S, self.model.GAN.G, latents, labels, noise, trunc_psi = trunc_psi)
         return generated_images
 
