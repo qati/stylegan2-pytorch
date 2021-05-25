@@ -1459,12 +1459,19 @@ class ModelLoader:
         self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len)
         self.model.load(load_from)
 
-    def noise_to_styles(self, noise,labels, trunc_psi = None):
+    def noise_to_styles(self, noise, labels, trunc_psi = None):
         noise = noise.cuda()
         w = self.model.GAN.SE(noise, labels)
         if exists(trunc_psi):
             w = self.model.truncate_style(w, labels)
         return w
+
+    @torch.no_grad()
+    def gen_style(self, style, labels, noi, trunc_psi = 0.75):
+        w = map(lambda x: (self.model.GAN.S(x[0][0], x[1]), x[0][1]), zip(style, [labels]*len(style)))
+        w_truncated = self.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
+        w_styles = styles_def_to_tensor(w_truncated)
+        return w_styles
 
     def styles_to_images(self, w):
         batch_size, *_ = w.shape
@@ -1475,6 +1482,6 @@ class ModelLoader:
         w_tensors = styles_def_to_tensor(w_def)
         noise = image_noise(batch_size, image_size, device = 0)
 
-        images = self.model.GAN.GE(w_tensors, noise)
+        images = self.model.GAN.G(w_tensors, noise)
         images.clamp_(0., 1.)
         return images
