@@ -470,7 +470,12 @@ class StyleVectorizer(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x, label):
+        print(label.shape)
         label = self.map(label)
+        print(label.shape)
+        print(x.shape)
+        print(x)
+        print(label)
         x = torch.cat((x, label), dim=1)
         x = F.normalize(x, dim=1)
         return self.net(x)
