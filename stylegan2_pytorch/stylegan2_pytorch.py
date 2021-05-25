@@ -1460,8 +1460,8 @@ class Trainer():
             amp.load_state_dict(load_data['amp'])
 
 class ModelLoader:
-    def __init__(self, *, base_dir, name = 'default', load_from = -1, cat_len=1):
-        self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len)
+    def __init__(self, *, base_dir, name = 'default', load_from = -1, cat_len=1,batch_size=1):
+        self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len,batch_size=batch_size)
         self.model.load(load_from)
 
     def noise_to_styles(self, noise, labels, trunc_psi = None):
