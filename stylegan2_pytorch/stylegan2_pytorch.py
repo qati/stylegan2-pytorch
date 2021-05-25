@@ -1466,6 +1466,9 @@ class ModelLoader:
             w = self.model.truncate_style(w, labels)
         return w
 
+    def latent_dim(self):
+        return self.model.GAN.G.latent_dim
+
     @torch.no_grad()
     def gen_style(self, style, labels, trunc_psi = 0.75):
         num_layers = self.model.GAN.G.num_layers
@@ -1473,6 +1476,14 @@ class ModelLoader:
         w = map(lambda x: (self.model.GAN.S(x[0][0], x[1]), x[0][1]), zip(style, [labels]*len(style)))
         w_truncated = self.model.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
         return w_truncated
+
+    def generate(self, latents, labels, trunc_psi):
+        image_size = self.model.image_size
+        noise = image_noise(1, image_size, device = 0)
+        print(latents)
+        print(labels)
+        generated_images = self.model.generate_truncated(self.model.GAN.S, self.model.GAN.G, latents, labels, noise, trunc_psi = trunc_psi)
+        return generated_images
 
     def styles_to_images(self, w):
         batch_size, *_ = w.shape
