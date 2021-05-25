@@ -470,12 +470,7 @@ class StyleVectorizer(nn.Module):
         self.net = nn.Sequential(*layers)
 
     def forward(self, x, label):
-        print(label.shape)
         label = self.map(label)
-        print(label.shape)
-        print(x.shape)
-        print(x)
-        print(label)
         x = torch.cat((x, label), dim=1)
         x = F.normalize(x, dim=1)
         return self.net(x)
@@ -1460,8 +1455,8 @@ class Trainer():
             amp.load_state_dict(load_data['amp'])
 
 class ModelLoader:
-    def __init__(self, *, base_dir, name = 'default', load_from = -1, cat_len=1,batch_size=1):
-        self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len,batch_size=batch_size)
+    def __init__(self, *, base_dir, name = 'default', load_from = -1, cat_len=1,batch_size=1,image_size=128):
+        self.model = Trainer(name = name, base_dir = base_dir, cat_len=cat_len,batch_size=batch_size, image_size=image_size)
         self.model.load(load_from)
 
     def noise_to_styles(self, noise, labels, trunc_psi = None):
@@ -1485,8 +1480,6 @@ class ModelLoader:
     def generate(self, latents, labels, trunc_psi):
         image_size = self.model.image_size
         noise = image_noise(1, image_size, device = 0)
-        print(latents)
-        print(labels)
         num_layers = self.model.GAN.G.num_layers
         latents = [(latents, num_layers)]
         generated_images = self.model.generate_truncated(self.model.GAN.S, self.model.GAN.G, latents, labels, noise, trunc_psi = trunc_psi)
