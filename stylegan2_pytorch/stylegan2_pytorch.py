@@ -1329,7 +1329,8 @@ class Trainer():
     def truncate_style_defs(self, w, labels, trunc_psi = 0.75):
         w_space = []
         if type(labels) == list:
-             for tensor, num_layers, label in zip(w, labels):
+             for w_, label in zip(w, labels):
+                tensor, num_layers = w_
                 tensor = self.truncate_style(tensor, label, trunc_psi = trunc_psi)            
                 w_space.append((tensor, num_layers))
         else:
