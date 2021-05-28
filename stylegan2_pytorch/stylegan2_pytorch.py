@@ -1340,6 +1340,14 @@ class Trainer():
         w_styles = styles_def_to_tensor(w_truncated)
         generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
         return generated_images.clamp_(0., 1.)
+    
+    @torch.no_grad()
+    def generate_truncated_multi_cat(self, S, G, style, labels, noi, trunc_psi = 0.75, num_image_tiles = 8):
+        w = map(lambda x: (S(x[0][0], x[1]), x[0][1]), zip(style, labels))
+        w_truncated = self.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
+        w_styles = styles_def_to_tensor(w_truncated)
+        generated_images = evaluate_in_chunks(self.batch_size, G, w_styles, noi)
+        return generated_images.clamp_(0., 1.)
 
     @torch.no_grad()
     def generate_interpolation(self, num = 0, num_image_tiles = 8, trunc = 1.0, num_steps = 100, save_frames = False):
@@ -1469,20 +1477,25 @@ class ModelLoader:
     def latent_dim(self):
         return self.model.GAN.G.latent_dim
 
+    def num_layers(self):
+        return self.model.GAN.G.num_layers
+
     @torch.no_grad()
     def gen_style(self, style, labels, trunc_psi = 0.75):
-        num_layers = self.model.GAN.G.num_layers
-        style = [(style, num_layers)]
         w = map(lambda x: (self.model.GAN.S(x[0][0], x[1]), x[0][1]), zip(style, [labels]*len(style)))
         w_truncated = self.model.truncate_style_defs(w, labels, trunc_psi = trunc_psi)
         return w_truncated
 
     def generate(self, latents, labels, trunc_psi):
         image_size = self.model.image_size
-        noise = image_noise(1, image_size, device = 0)
-        num_layers = self.model.GAN.G.num_layers
-        latents = [(latents, num_layers)]
+        noise = image_noise(latents[0][0].shape[0], image_size, device = 0)
         generated_images = self.model.generate_truncated(self.model.GAN.S, self.model.GAN.G, latents, labels, noise, trunc_psi = trunc_psi)
+        return generated_images
+
+    def generate_n(self, latents, labels, trunc_psi):
+        image_size = self.model.image_size
+        noise = image_noise(latents[0][0].shape[0], image_size, device = 0)
+        generated_images = self.model.generate_truncated_multi_cat(self.model.GAN.S, self.model.GAN.G, latents, labels, noise, trunc_psi = trunc_psi)
         return generated_images
 
     def styles_to_images(self, w):
