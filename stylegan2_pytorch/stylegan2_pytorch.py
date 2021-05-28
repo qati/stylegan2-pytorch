@@ -1328,9 +1328,14 @@ class Trainer():
     @torch.no_grad()
     def truncate_style_defs(self, w, labels, trunc_psi = 0.75):
         w_space = []
-        for tensor, num_layers in w:
-            tensor = self.truncate_style(tensor, labels, trunc_psi = trunc_psi)            
-            w_space.append((tensor, num_layers))
+        if type(labels) == list:
+             for tensor, num_layers, label in zip(w, labels):
+                tensor = self.truncate_style(tensor, label, trunc_psi = trunc_psi)            
+                w_space.append((tensor, num_layers))
+        else:
+            for tensor, num_layers in w:
+                tensor = self.truncate_style(tensor, labels, trunc_psi = trunc_psi)            
+                w_space.append((tensor, num_layers))
         return w_space
 
     @torch.no_grad()
